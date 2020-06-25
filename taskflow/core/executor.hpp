@@ -22,9 +22,13 @@ an efficient work-stealing scheduling algorithm to run a taskflow.
 
 */
 class Executor {
-
   friend class Subflow;
-
+  struct DefaultThreadCreator {
+    template<class Function, class... Args>
+    std::thread operator()(size_t, Domain, Function&& f, Args&&... args ) {
+      return std::thread(std::forward<Function>(f), std::forward<Args>(args)...);
+    }
+  };
   struct Worker {
     size_t id;
     size_t vtm;
@@ -51,15 +55,19 @@ class Executor {
     /**
     @brief constructs the executor with N/M cpu/gpu worker threads
     */
+    template<class ThreadCreator=DefaultThreadCreator>
     explicit Executor(
       size_t N = std::thread::hardware_concurrency(),
       size_t M = cuda_num_devices()
+      ThreadCreator&& tc=ThreadCreator());
     );
 #else
     /**
     @brief constructs the executor with N worker threads
     */
-    explicit Executor(size_t N = std::thread::hardware_concurrency());
+    template<class ThreadCreator=DefaultThreadCreator>
+    explicit Executor(size_t N = std::thread::hardware_concurrency(),
+                      ThreadCreator&& tc=ThreadCreator());
 #endif
     
     /**
@@ -258,7 +266,8 @@ class Executor {
     void _flush_tfprof();
     void _observer_prologue(Worker&, Node*);
     void _observer_epilogue(Worker&, Node*);
-    void _spawn(size_t, Domain);
+    template<class ThreadCreator>
+    void _spawn(size_t, Domain, ThreadCreator& tc);
     void _worker_loop(Worker&);
     void _exploit_task(Worker&, Node*&);
     void _explore_task(Worker&, Node*&);
@@ -287,7 +296,8 @@ class Executor {
 
 #ifdef TF_ENABLE_CUDA
 // Constructor
-inline Executor::Executor(size_t N, size_t M) :
+template<class ThreadCreator>
+inline Executor::Executor(size_t N, size_t M, ThreadCreator&& tc) :
   _VICTIM_BEG   {0},
   _VICTIM_END   {N + M - 1},
   _MAX_STEALS   {(N + M + 1) << 1},
@@ -321,16 +331,18 @@ inline Executor::Executor(size_t N, size_t M) :
     }
   }
 
-  _spawn(N, HOST);
-  _spawn(M, CUDA);
+  _spawn(N, HOST, tc);
+  _spawn(M, CUDA, tc);
 
   // initiate the observer if requested
   _instantiate_tfprof();
 }
 
 #else
+
 // Constructor
-inline Executor::Executor(size_t N) : 
+template<class ThreadCreator>
+Executor::Executor(size_t N, ThreadCreator&& tc) :
   _VICTIM_BEG {0},
   _VICTIM_END {N - 1},
   _MAX_STEALS {(N + 1) << 1},
@@ -347,7 +359,7 @@ inline Executor::Executor(size_t N) :
     _num_thieves[i].store(0, std::memory_order_relaxed); 
   }
 
-  _spawn(N, HOST);
+  _spawn(N, HOST, tc);
 
   // instantite the default observer if requested
   _instantiate_tfprof();
@@ -430,7 +442,8 @@ inline int Executor::this_worker_id() const {
 }
 
 // Procedure: _spawn
-inline void Executor::_spawn(size_t N, Domain d) {
+template<class ThreadCreator>
+inline void Executor::_spawn(size_t N, Domain d, ThreadCreator& tc) {
   
   auto id = _threads.size();
 
@@ -443,27 +456,28 @@ inline void Executor::_spawn(size_t N, Domain d) {
     _workers[id].domain = d;
     _workers[id].executor = this;
     _workers[id].waiter = &_notifier[d]._waiters[i];
-    
-    _threads.emplace_back([this] (Worker& w) -> void {
 
-      PerThread& pt = _per_thread();  
-      pt.worker = &w;
+    _threads.emplace_back(
+      tc(i, d, [this] (Worker& w) -> void {
 
-      Node* t = nullptr;
+        PerThread& pt = _per_thread();
+        pt.worker = &w;
 
-      // must use 1 as condition instead of !done
-      while(1) {
-        
-        // execute the tasks.
-        _exploit_task(w, t);
+        Node* t = nullptr;
 
-        // wait for tasks
-        if(_wait_for_task(w, t) == false) {
-          break;
+        // must use 1 as condition instead of !done
+        while(1) {
+
+          // execute the tasks.
+          _exploit_task(w, t);
+
+          // wait for tasks
+          if(_wait_for_task(w, t) == false) {
+            break;
+          }
         }
-      }
-      
-    }, std::ref(_workers[id]));     
+        
+      }, std::ref(_workers[id])));
   }
 
 }
